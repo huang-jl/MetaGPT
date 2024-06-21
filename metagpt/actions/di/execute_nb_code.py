@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import re
+import time
 from typing import Literal, Tuple
 
 import nbformat
@@ -113,17 +114,14 @@ class ExecuteNbCode(Action):
         for i, output in enumerate(outputs):
             output_text = ""
             if output["output_type"] == "stream" and not any(
-                tag in output["text"]
-                for tag in ["| INFO     | metagpt", "| ERROR    | metagpt", "| WARNING  | metagpt", "DEBUG"]
+                tag in output["text"] for tag in ["| INFO     | metagpt", "| ERROR    | metagpt", "| WARNING  | metagpt", "DEBUG"]
             ):
                 output_text = output["text"]
             elif output["output_type"] == "display_data":
                 if "image/png" in output["data"]:
                     self.show_bytes_figure(output["data"]["image/png"], self.interaction)
                 else:
-                    logger.info(
-                        f"{i}th output['data'] from nbclient outputs dont have image/png, continue next output ..."
-                    )
+                    logger.info(f"{i}th output['data'] from nbclient outputs dont have image/png, continue next output ...")
             elif output["output_type"] == "execute_result":
                 output_text = output["data"]["text/plain"]
             elif output["output_type"] == "error":
@@ -192,8 +190,8 @@ class ExecuteNbCode(Action):
         return the output of code execution, and a success indicator (bool) of code execution.
         """
         self._display(code, language)
-
         if language == "python":
+            start = time.time()
             # add code to the notebook
             self.add_code_cell(code=code)
 
@@ -207,6 +205,8 @@ class ExecuteNbCode(Action):
             if "!pip" in code:
                 success = False
 
+            elapsed = time.time() - start
+            logger.info("execute code spend %s seconds", elapsed) 
             return outputs, success
 
         elif language == "markdown":
