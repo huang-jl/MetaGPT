@@ -206,7 +206,7 @@ class ExecuteNbCode(Action):
                 success = False
 
             elapsed = time.time() - start
-            logger.info("execute code spend %s seconds", elapsed) 
+            logger.info("execute code spend {} seconds", elapsed) 
             return outputs, success
 
         elif language == "markdown":
