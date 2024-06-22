@@ -129,6 +129,9 @@ class DataInterpreter(Role):
             ### execute code ###
             result, success = await self.execute_code.run(code)
             print(result)
+            # restrict the output of code execution
+            if len(result) > 2048:
+                result = result[:2048]
 
             self.working_memory.add(Message(content=result, role="user", cause_by=ExecuteNbCode))
 
