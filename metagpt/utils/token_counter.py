@@ -224,6 +224,7 @@ TOKEN_MAX = {
     "doubao-pro-4k-240515": 4000,
     "doubao-pro-32k-240515": 32000,
     "doubao-pro-128k-240515": 128000,
+    "Qwen2-57B-A14B-Instruct": 65536,
 }
 
 # For Amazon Bedrock US region
