@@ -26,7 +26,7 @@ requirements = (here / "requirements.txt").read_text(encoding="utf-8").splitline
 extras_require = {
     "selenium": ["selenium>4", "webdriver_manager", "beautifulsoup4"],
     "search-google": ["google-api-python-client==2.94.0"],
-    "search-ddg": ["duckduckgo-search~=4.1.1"],
+    "search-ddg": ["duckduckgo-search~=6.1.7"],
     "ocr": ["paddlepaddle==2.4.2", "paddleocr~=2.7.3", "tabulate==0.9.0"],
     "rag": [
         "llama-index-core==0.10.15",
