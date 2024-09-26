@@ -10,13 +10,14 @@ import asyncio
 import base64
 import re
 import time
-from typing import Literal, Tuple
+from typing import Literal, Tuple, Optional
 
 import nbformat
 from nbclient import NotebookClient
 from nbclient.exceptions import CellTimeoutError, DeadKernelError
 from nbformat import NotebookNode
 from nbformat.v4 import new_code_cell, new_markdown_cell, new_output
+from pydantic import Field
 from rich.box import MINIMAL
 from rich.console import Console, Group
 from rich.live import Live
@@ -24,8 +25,188 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.syntax import Syntax
 
+from sandbox_sdk.code_interpreter import CodeInterpreter
+
 from metagpt.actions import Action
 from metagpt.logs import logger
+
+
+class ExecuteCode(Action):
+    ci: Optional[CodeInterpreter] = None
+    console: Console = Field(default_factory=Console)
+    timeout: int = 600
+    template: str = "default-code-interpreter"
+
+    async def build(self):
+        if self.ci is None:
+            self.ci = await CodeInterpreter.create(
+                template=self.template, timeout=self.timeout
+            )
+
+    async def terminate(self):
+        if self.ci is not None:
+            await self.ci.close()
+            # kill the sandbox
+            await CodeInterpreter.kill(self.ci.id)
+
+
+    async def reset(self):
+        """reset NotebookClient"""
+        raise NotImplementedError("currently has not implemented reset()")
+
+    def add_code_cell(self, code: str):
+        pass
+
+    def add_markdown_cell(self, markdown: str):
+        pass
+
+    def _display(self, code: str, language: Literal["python", "markdown"] = "python"):
+        if language == "python":
+            syntax = Syntax(code, "python", theme="paraiso-dark", line_numbers=True)
+            self.console.print(syntax)
+        elif language == "markdown":
+            display_markdown(code)
+        else:
+            raise ValueError(f"Only support for python, markdown, but got {language}")
+
+    def add_output_to_cell(self, cell: NotebookNode, output: str):
+        """add outputs of code execution to notebook cell."""
+        if "outputs" not in cell:
+            cell["outputs"] = []
+        else:
+            cell["outputs"].append(
+                new_output(output_type="stream", name="stdout", text=str(output))
+            )
+
+    def parse_outputs(
+        self, outputs: list[str], keep_len: int = 2000
+    ) -> Tuple[bool, str]:
+        """Parses the outputs received from notebook execution."""
+        assert isinstance(outputs, list)
+        parsed_output, is_success = [], True
+        for i, output in enumerate(outputs):
+            output_text = ""
+            if output["output_type"] == "stream" and not any(
+                tag in output["text"]
+                for tag in [
+                    "| INFO     | metagpt",
+                    "| ERROR    | metagpt",
+                    "| WARNING  | metagpt",
+                    "DEBUG",
+                ]
+            ):
+                output_text = output["text"]
+            elif output["output_type"] == "display_data":
+                if "image/png" in output["data"]:
+                    self.show_bytes_figure(
+                        output["data"]["image/png"], self.interaction
+                    )
+                else:
+                    logger.info(
+                        f"{i}th output['data'] from nbclient outputs dont have image/png, continue next output ..."
+                    )
+            elif output["output_type"] == "execute_result":
+                output_text = output["data"]["text/plain"]
+            elif output["output_type"] == "error":
+                output_text, is_success = "\n".join(output["traceback"]), False
+
+            # handle coroutines that are not executed asynchronously
+            if output_text.strip().startswith("<coroutine object"):
+                output_text = "Executed code failed, you need use key word 'await' to run a async code."
+                is_success = False
+
+            output_text = remove_escape_and_color_codes(output_text)
+            # The useful information of the exception is at the end,
+            # the useful information of normal output is at the begining.
+            output_text = (
+                output_text[:keep_len] if is_success else output_text[-keep_len:]
+            )
+
+            parsed_output.append(output_text)
+        return is_success, ",".join(parsed_output)
+
+    def show_bytes_figure(
+        self, image_base64: str, interaction_type: Literal["ipython", None]
+    ):
+        image_bytes = base64.b64decode(image_base64)
+        if interaction_type == "ipython":
+            from IPython.display import Image, display
+
+            display(Image(data=image_bytes))
+        else:
+            import io
+
+            from PIL import Image
+
+            image = Image.open(io.BytesIO(image_bytes))
+            image.show()
+
+    def is_ipython(self) -> bool:
+        try:
+            # 如果在Jupyter Notebook中运行，__file__ 变量不存在
+            from IPython import get_ipython
+
+            if get_ipython() is not None and "IPKernelApp" in get_ipython().config:
+                return True
+            else:
+                return False
+        except NameError:
+            return False
+
+    async def run_cell(self, cell: NotebookNode, cell_index: int) -> Tuple[bool, str]:
+        """set timeout for run code.
+        returns the success or failure of the cell execution, and an optional error message.
+        """
+        try:
+            await self.nb_client.async_execute_cell(cell, cell_index)
+            return self.parse_outputs(self.nb.cells[-1].outputs)
+        except CellTimeoutError:
+            assert self.nb_client.km is not None
+            await self.nb_client.km.interrupt_kernel()
+            await asyncio.sleep(1)
+            error_msg = "Cell execution timed out: Execution exceeded the time limit and was stopped; consider optimizing your code for better performance."
+            return False, error_msg
+        except DeadKernelError:
+            await self.reset()
+            return False, "DeadKernelError"
+        except Exception:
+            return self.parse_outputs(self.nb.cells[-1].outputs)
+
+    async def run(
+        self, code: str, language: Literal["python", "markdown"] = "python"
+    ) -> Tuple[str, bool]:
+        """
+        return the output of code execution, and a success indicator (bool) of code execution.
+        """
+        self._display(code, language)
+        if language == "python":
+            start = time.time()
+            # add code to the notebook
+            self.add_code_cell(code=code)
+
+            # build code executor
+            await self.build()
+
+            # run code
+            cell_index = len(self.nb.cells) - 1
+            success, outputs = await self.run_cell(self.nb.cells[-1], cell_index)
+
+            if "!pip" in code:
+                success = False
+
+            elapsed = time.time() - start
+            logger.info("execute code spend {} seconds", elapsed)
+            return outputs, success
+
+        elif language == "markdown":
+            # add markdown content to markdown cell in a notebook.
+            self.add_markdown_cell(code)
+            # return True, beacuse there is no execution failure for markdown cell.
+            return code, True
+        else:
+            raise ValueError(
+                f"Only support for language: python, markdown, but got {language}, "
+            )
 
 
 class ExecuteNbCode(Action):
@@ -105,23 +286,37 @@ class ExecuteNbCode(Action):
         if "outputs" not in cell:
             cell["outputs"] = []
         else:
-            cell["outputs"].append(new_output(output_type="stream", name="stdout", text=str(output)))
+            cell["outputs"].append(
+                new_output(output_type="stream", name="stdout", text=str(output))
+            )
 
-    def parse_outputs(self, outputs: list[str], keep_len: int = 2000) -> Tuple[bool, str]:
+    def parse_outputs(
+        self, outputs: list[str], keep_len: int = 2000
+    ) -> Tuple[bool, str]:
         """Parses the outputs received from notebook execution."""
         assert isinstance(outputs, list)
         parsed_output, is_success = [], True
         for i, output in enumerate(outputs):
             output_text = ""
             if output["output_type"] == "stream" and not any(
-                tag in output["text"] for tag in ["| INFO     | metagpt", "| ERROR    | metagpt", "| WARNING  | metagpt", "DEBUG"]
+                tag in output["text"]
+                for tag in [
+                    "| INFO     | metagpt",
+                    "| ERROR    | metagpt",
+                    "| WARNING  | metagpt",
+                    "DEBUG",
+                ]
             ):
                 output_text = output["text"]
             elif output["output_type"] == "display_data":
                 if "image/png" in output["data"]:
-                    self.show_bytes_figure(output["data"]["image/png"], self.interaction)
+                    self.show_bytes_figure(
+                        output["data"]["image/png"], self.interaction
+                    )
                 else:
-                    logger.info(f"{i}th output['data'] from nbclient outputs dont have image/png, continue next output ...")
+                    logger.info(
+                        f"{i}th output['data'] from nbclient outputs dont have image/png, continue next output ..."
+                    )
             elif output["output_type"] == "execute_result":
                 output_text = output["data"]["text/plain"]
             elif output["output_type"] == "error":
@@ -135,12 +330,16 @@ class ExecuteNbCode(Action):
             output_text = remove_escape_and_color_codes(output_text)
             # The useful information of the exception is at the end,
             # the useful information of normal output is at the begining.
-            output_text = output_text[:keep_len] if is_success else output_text[-keep_len:]
+            output_text = (
+                output_text[:keep_len] if is_success else output_text[-keep_len:]
+            )
 
             parsed_output.append(output_text)
         return is_success, ",".join(parsed_output)
 
-    def show_bytes_figure(self, image_base64: str, interaction_type: Literal["ipython", None]):
+    def show_bytes_figure(
+        self, image_base64: str, interaction_type: Literal["ipython", None]
+    ):
         image_bytes = base64.b64decode(image_base64)
         if interaction_type == "ipython":
             from IPython.display import Image, display
@@ -185,7 +384,9 @@ class ExecuteNbCode(Action):
         except Exception:
             return self.parse_outputs(self.nb.cells[-1].outputs)
 
-    async def run(self, code: str, language: Literal["python", "markdown"] = "python") -> Tuple[str, bool]:
+    async def run(
+        self, code: str, language: Literal["python", "markdown"] = "python"
+    ) -> Tuple[str, bool]:
         """
         return the output of code execution, and a success indicator (bool) of code execution.
         """
@@ -206,7 +407,7 @@ class ExecuteNbCode(Action):
                 success = False
 
             elapsed = time.time() - start
-            logger.info("execute code spend {} seconds", elapsed) 
+            logger.info("execute code spend {} seconds", elapsed)
             return outputs, success
 
         elif language == "markdown":
@@ -215,7 +416,9 @@ class ExecuteNbCode(Action):
             # return True, beacuse there is no execution failure for markdown cell.
             return code, True
         else:
-            raise ValueError(f"Only support for language: python, markdown, but got {language}, ")
+            raise ValueError(
+                f"Only support for language: python, markdown, but got {language}, "
+            )
 
 
 def remove_escape_and_color_codes(input_str: str):
@@ -239,10 +442,14 @@ def display_markdown(content: str):
         code_content = match.group(0).strip()[3:-3]  # Remove triple backticks
 
         if text_content:
-            content_panels.append(Panel(Markdown(text_content), style=style, box=MINIMAL))
+            content_panels.append(
+                Panel(Markdown(text_content), style=style, box=MINIMAL)
+            )
 
         if code_content:
-            content_panels.append(Panel(Markdown(f"```{code_content}"), style=style, box=MINIMAL))
+            content_panels.append(
+                Panel(Markdown(f"```{code_content}"), style=style, box=MINIMAL)
+            )
         start_index = match.end()
 
     # Print remaining text (if any).
@@ -251,6 +458,8 @@ def display_markdown(content: str):
         content_panels.append(Panel(Markdown(remaining_text), style=style, box=MINIMAL))
 
     # Display all panels in Live mode.
-    with Live(auto_refresh=False, console=Console(), vertical_overflow="visible") as live:
+    with Live(
+        auto_refresh=False, console=Console(), vertical_overflow="visible"
+    ) as live:
         live.update(Group(*content_panels))
         live.refresh()
